@@ -1,0 +1,535 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Game Catur + Panel Owner</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    html,body,#root { height: 100%; }
+    /* small tweak for board aspect */
+    .aspect-square { position: relative; padding-bottom: 100%; }
+    .aspect-square > .board-inner { position: absolute; inset: 0; }
+  </style>
+</head>
+<body class="bg-slate-50">
+  <div id="root" class="p-4"></div>
+
+  <!-- React + Babel -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <script type="text/babel">
+  const { useEffect, useMemo, useRef, useState } = React;
+
+  // ==========================
+  // CHESS + OWNER PANEL + BOT
+  // ==========================
+  // Note: en passant & castling not implemented in this single-file version.
+  // Promotion auto to queen.
+
+  const makePiece = (t, c) => ({ t, c });
+
+  const initialBoardFactory = () => {
+    const E = null;
+    return [
+      [makePiece('r','b'), makePiece('n','b'), makePiece('b','b'), makePiece('q','b'), makePiece('k','b'), makePiece('b','b'), makePiece('n','b'), makePiece('r','b')],
+      [makePiece('p','b'), makePiece('p','b'), makePiece('p','b'), makePiece('p','b'), makePiece('p','b'), makePiece('p','b'), makePiece('p','b'), makePiece('p','b')],
+      [E,E,E,E,E,E,E,E],
+      [E,E,E,E,E,E,E,E],
+      [E,E,E,E,E,E,E,E],
+      [E,E,E,E,E,E,E,E],
+      [makePiece('p','w'), makePiece('p','w'), makePiece('p','w'), makePiece('p','w'), makePiece('p','w'), makePiece('p','w'), makePiece('p','w'), makePiece('p','w')],
+      [makePiece('r','w'), makePiece('n','w'), makePiece('b','w'), makePiece('q','w'), makePiece('k','w'), makePiece('b','w'), makePiece('n','w'), makePiece('r','w')],
+    ];
+  };
+
+  function ChessWithOwnerPanel(){
+    const initialBoard = useMemo(()=>initialBoardFactory(), []);
+    const [board, setBoard] = useState(initialBoard);
+    const [turn, setTurn] = useState('w');
+    const [selected, setSelected] = useState(null);
+    const [legalMoves, setLegalMoves] = useState([]);
+    const [history, setHistory] = useState([]);
+    const [future, setFuture] = useState([]);
+    const [flipped, setFlipped] = useState(false);
+
+    const [ownerPin, setOwnerPin] = useState("1234");
+    const [pinInput, setPinInput] = useState("");
+    const [ownerMode, setOwnerMode] = useState(false);
+    const [lockHumanInput, setLockHumanInput] = useState(false);
+
+    const [aiEnabled, setAiEnabled] = useState(true);
+    const [aiPlays, setAiPlays] = useState('b');
+    const [aiDepth, setAiDepth] = useState(2);
+    const thinkingRef = useRef(false);
+
+    const cloneBoard = (b) => b.map(row => row.map(cell => cell ? { ...cell } : null));
+    const inBounds = (r, c) => r>=0 && r<8 && c>=0 && c<8;
+    const other = (c) => c === 'w' ? 'b' : 'w';
+
+    const squareColor = (r, c) => ((r + c) % 2 === 0 ? 'light' : 'dark');
+    const toAlgebra = (r, c) => `${String.fromCharCode(97 + c)}${8 - r}`;
+
+    const addMoveIf = (moves, r, c, color, b) => {
+      if (!inBounds(r, c)) return false;
+      const target = b[r][c];
+      if (!target) { moves.push({ r, c }); return true; }
+      if (target.c !== color) { moves.push({ r, c }); return false; }
+      return false;
+    };
+
+    const genPseudoMoves = (fromR, fromC, b) => {
+      const piece = b[fromR][fromC];
+      if (!piece) return [];
+      const { t, c } = piece;
+      const moves = [];
+
+      if (t === 'p') {
+        const dir = c === 'w' ? -1 : 1;
+        const startRow = c === 'w' ? 6 : 1;
+        const f1 = { r: fromR + dir, c: fromC };
+        if (inBounds(f1.r, f1.c) && !b[f1.r][f1.c]) {
+          moves.push(f1);
+          const f2 = { r: fromR + 2*dir, c: fromC };
+          if (fromR === startRow && inBounds(f2.r, f2.c) && !b[f2.r][f2.c]) moves.push(f2);
+        }
+        for (const dc of [-1, 1]) {
+          const rr = fromR + dir, cc = fromC + dc;
+          if (inBounds(rr, cc) && b[rr][cc] && b[rr][cc].c !== c) moves.push({ r: rr, c: cc });
+        }
+        return moves;
+      }
+
+      if (t === 'n') {
+        const deltas = [[-2,-1],[-2,1],[-1,-2],[-1,2],[1,-2],[1,2],[2,-1],[2,1]];
+        for (const [dr, dc] of deltas) addMoveIf(moves, fromR+dr, fromC+dc, c, b);
+        return moves;
+      }
+
+      if (t === 'k') {
+        for (let dr=-1; dr<=1; dr++) for (let dc=-1; dc<=1; dc++) {
+          if (dr===0 && dc===0) continue;
+          addMoveIf(moves, fromR+dr, fromC+dc, c, b);
+        }
+        return moves;
+      }
+
+      const slideDirs = {
+        b: [[-1,-1],[-1,1],[1,-1],[1,1]],
+        r: [[-1,0],[1,0],[0,-1],[0,1]],
+        q: [[-1,-1],[-1,1],[1,-1],[1,1],[-1,0],[1,0],[0,-1],[0,1]],
+      };
+
+      if (t === 'b' || t === 'r' || t === 'q') {
+        for (const [dr, dc] of slideDirs[t]) {
+          let rr = fromR + dr, cc = fromC + dc;
+          while (inBounds(rr, cc)) {
+            const cont = addMoveIf(moves, rr, cc, c, b);
+            if (!cont) break;
+            rr += dr; cc += dc;
+          }
+        }
+        return moves;
+      }
+      return moves;
+    };
+
+    const findKing = (b, color) => {
+      for (let r=0;r<8;r++) for (let c=0;c<8;c++) if (b[r][c]?.t==='k' && b[r][c]?.c===color) return {r,c};
+      return null;
+    };
+
+    const squareAttackedBy = (b, r, c, attackerColor) => {
+      for (let rr=0; rr<8; rr++) {
+        for (let cc=0; cc<8; cc++) {
+          const p = b[rr][cc];
+          if (!p || p.c !== attackerColor) continue;
+          const moves = genPseudoMoves(rr, cc, b);
+          for (const m of moves) {
+            if (m.r === r && m.c === c) return true;
+          }
+        }
+      }
+      return false;
+    };
+
+    const isKingInCheck = (b, color) => {
+      const k = findKing(b, color);
+      if (!k) return false;
+      return squareAttackedBy(b, k.r, k.c, other(color));
+    };
+
+    const genLegalMovesFrom = (r, c, b) => {
+      const p = b[r][c];
+      if (!p) return [];
+      const pseudo = genPseudoMoves(r, c, b);
+      const legal = [];
+      for (const m of pseudo) {
+        const nb = cloneBoard(b);
+        nb[m.r][m.c] = { ...p };
+        nb[r][c] = null;
+        if (p.t==='p' && (m.r===0 || m.r===7)) nb[m.r][m.c].t='q';
+        if (!isKingInCheck(nb, p.c)) legal.push(m);
+      }
+      return legal;
+    };
+
+    const anyLegalMoves = (b, color) => {
+      for (let r=0;r<8;r++) for (let c=0;c<8;c++) {
+        const p = b[r][c];
+        if (!p || p.c!==color) continue;
+        if (genLegalMovesFrom(r,c,b).length) return true;
+      }
+      return false;
+    };
+
+    const pieceValue = { p:100, n:320, b:330, r:500, q:900, k:20000 };
+
+    const evaluate = (b) => {
+      let score = 0;
+      for (let r=0;r<8;r++) for (let c=0;c<8;c++) {
+        const p = b[r][c];
+        if (!p) continue;
+        const sign = p.c==='w' ? 1 : -1;
+        score += sign * pieceValue[p.t];
+      }
+      return score;
+    };
+
+    const listAllMoves = (b, color) => {
+      const out = [];
+      for (let r=0;r<8;r++) for (let c=0;c<8;c++) {
+        const p = b[r][c];
+        if (!p || p.c!==color) continue;
+        const moves = genLegalMovesFrom(r,c,b);
+        for (const m of moves) out.push({ from:{r,c}, to:m });
+      }
+      return out;
+    };
+
+    const makeMoveOn = (b, move) => {
+      const nb = cloneBoard(b);
+      const p = nb[move.from.r][move.from.c];
+      if (!p) return nb;
+      nb[move.to.r][move.to.c] = { ...p };
+      nb[move.from.r][move.from.c] = null;
+      if (p.t==='p' && (move.to.r===0 || move.to.r===7)) nb[move.to.r][move.to.c].t='q';
+      return nb;
+    };
+
+    const minimax = (b, depth, maximizing, alpha, beta) => {
+      if (depth === 0) return { score: evaluate(b) };
+
+      const color = maximizing ? 'w' : 'b';
+      if (!anyLegalMoves(b, color)) {
+        const inCheck = isKingInCheck(b, color);
+        if (inCheck) return { score: maximizing ? -999999 : 999999 };
+        return { score: 0 };
+      }
+
+      let best = maximizing ? { score: -Infinity } : { score: Infinity };
+      const moves = listAllMoves(b, color);
+
+      moves.sort((A,B)=>{
+        const ta = b[A.to.r][A.to.c];
+        const tb = b[B.to.r][B.to.c];
+        const va = ta ? pieceValue[ta.t] : 0;
+        const vb = tb ? pieceValue[tb.t] : 0;
+        return (vb - va);
+      });
+
+      for (const mv of moves) {
+        const nb = makeMoveOn(b, mv);
+        const res = minimax(nb, depth-1, !maximizing, alpha, beta);
+        if (maximizing) {
+          if (res.score > best.score) best = { ...res, move: mv };
+          alpha = Math.max(alpha, res.score);
+          if (beta <= alpha) break;
+        } else {
+          if (res.score < best.score) best = { ...res, move: mv };
+          beta = Math.min(beta, res.score);
+          if (beta <= alpha) break;
+        }
+      }
+      return best;
+    };
+
+    const computeBestMove = (b, color, depth) => {
+      const maximizing = (color === 'w');
+      const res = minimax(b, depth, maximizing, -Infinity, Infinity);
+      return res && res.move ? res.move : null;
+    };
+
+    const resetGame = () => {
+      setBoard(cloneBoard(initialBoard));
+      setTurn('w');
+      setSelected(null);
+      setLegalMoves([]);
+      setHistory([]);
+      setFuture([]);
+    };
+
+    const undo = () => {
+      if (!history.length) return;
+      const last = history[history.length-1];
+      setFuture(f => [...f, { board: cloneBoard(board), turn }]);
+      setBoard(last.board);
+      setTurn(last.turn);
+      setHistory(h => h.slice(0, -1));
+      setSelected(null);
+      setLegalMoves([]);
+    };
+
+    const redo = () => {
+      if (!future.length) return;
+      const nxt = future[future.length-1];
+      setHistory(h => [...h, { board: cloneBoard(board), turn }]);
+      setBoard(nxt.board);
+      setTurn(nxt.turn);
+      setFuture(f => f.slice(0, -1));
+      setSelected(null);
+      setLegalMoves([]);
+    };
+
+    const makeMove = (from, to) => {
+      const b = cloneBoard(board);
+      const p = b[from.r][from.c];
+      if (!p) return;
+      b[to.r][to.c] = { ...p };
+      b[from.r][from.c] = null;
+      if (p.t==='p' && (to.r===0 || to.r===7)) b[to.r][to.c].t='q';
+
+      setHistory(h => [...h, { board: cloneBoard(board), turn }]);
+      setFuture([]);
+      setBoard(b);
+      setTurn(other(turn));
+      setSelected(null);
+      setLegalMoves([]);
+    };
+
+    const onSquareClick = (r, c) => {
+      if (lockHumanInput && !ownerMode) return;
+      if (aiEnabled && turn === aiPlays && !ownerMode) return;
+
+      const p = board[r][c];
+      if (selected && legalMoves.some(m => m.r===r && m.c===c)) {
+        makeMove(selected, { r, c });
+        return;
+      }
+      if (p && p.c === turn) {
+        setSelected({ r, c });
+        setLegalMoves(genLegalMovesFrom(r,c,board));
+      } else {
+        setSelected(null);
+        setLegalMoves([]);
+      }
+    };
+
+    useEffect(() => {
+      if (!aiEnabled) return;
+      if (turn !== aiPlays) return;
+      if (thinkingRef.current) return;
+
+      const bNow = board;
+      const side = turn;
+      const hasMoves = anyLegalMoves(bNow, side);
+      if (!hasMoves) return;
+
+      thinkingRef.current = true;
+      const timer = setTimeout(() => {
+        try {
+          const best = computeBestMove(bNow, side, aiDepth);
+          if (best) {
+            makeMove(best.from, best.to);
+          }
+        } catch (err) {
+          console.error('AI error', err);
+        } finally {
+          thinkingRef.current = false;
+        }
+      }, 50);
+
+      return () => {
+        clearTimeout(timer);
+        thinkingRef.current = false;
+      };
+    }, [board, turn, aiEnabled, aiPlays, aiDepth]);
+
+    const gameStatus = useMemo(() => {
+      const side = turn === 'w' ? 'Putih' : 'Hitam';
+      const has = anyLegalMoves(board, turn);
+      const check = isKingInCheck(board, turn);
+      if (!has) {
+        if (check) return `Skakmat! ${turn==='w'?'Putih':'Hitam'} kalah.`;
+        return 'Stalemate (Seri).';
+      }
+      return `${side} jalan${check ? ' — SKAK!' : ''}`;
+    }, [board, turn]);
+
+    const renderPiece = (p) => {
+      if (!p) return null;
+      const map = {
+        p: { w: '♙', b: '♟' },
+        r: { w: '♖', b: '♜' },
+        n: { w: '♘', b: '♞' },
+        b: { w: '♗', b: '♝' },
+        q: { w: '♕', b: '♛' },
+        k: { w: '♔', b: '♚' },
+      };
+      return <span className="text-3xl select-none">{map[p.t][p.c]}</span>;
+    };
+
+    const boardCoords = useMemo(() => {
+      const coords = [];
+      for (let r=0;r<8;r++) {
+        for (let c=0;c<8;c++) {
+          const rr = flipped ? 7 - r : r;
+          const cc = flipped ? 7 - c : c;
+          coords.push({ r: rr, c: cc });
+        }
+      }
+      return coords;
+    }, [flipped]);
+
+    const isMoveDest = (r,c) => legalMoves.some(m => m.r===r && m.c===c);
+
+    return (
+      <div className="min-h-screen w-full bg-slate-50 text-slate-800 p-4">
+        <div className="max-w-6xl mx-auto grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_380px] gap-4">
+          <div>
+            <header className="flex items-center justify-between mb-3">
+              <h1 className="text-2xl font-bold">Game Catur</h1>
+              <div className="flex gap-2">
+                <button onClick={() => setFlipped(f => !f)} className="px-3 py-1 rounded-2xl shadow bg-white">
+                  Flip Board
+                </button>
+                <button onClick={resetGame} className="px-3 py-1 rounded-2xl shadow bg-white">Reset</button>
+              </div>
+            </header>
+
+            <div className="aspect-square w-full max-w-[640px] mx-auto rounded-2xl overflow-hidden shadow-lg">
+              <div className="board-inner grid grid-cols-8 grid-rows-8 h-full w-full">
+                {boardCoords.map(({r,c}, idx) => {
+                  const p = board[r][c];
+                  const sel = selected && selected.r===r && selected.c===c;
+                  const canMove = isMoveDest(r,c);
+                  const base = squareColor(r,c) === 'light' ? 'bg-amber-100' : 'bg-emerald-700';
+                  const hlSel = sel ? 'ring-4 ring-cyan-400' : '';
+                  return (
+                    <button key={idx}
+                            onClick={() => onSquareClick(r,c)}
+                            className={`relative flex items-center justify-center ${base} ${hlSel} hover:brightness-105`}
+                            title={p ? `${p.c==='w'?'Putih':'Hitam'} ${p.t.toUpperCase()} @ ${toAlgebra(r,c)}` : toAlgebra(r,c)}>
+                      {renderPiece(p)}
+                      {canMove && <span className="absolute w-4 h-4 rounded-full bg-black/20 pointer-events-none"></span>}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <span className="px-3 py-1 rounded-2xl bg-white shadow">{gameStatus}</span>
+              <span className="px-3 py-1 rounded-2xl bg-white shadow">Giliran: {turn==='w'?'Putih':'Hitam'}</span>
+              <span className="px-3 py-1 rounded-2xl bg-white shadow">AI: {aiEnabled ? `ON (${aiPlays==='w'?'Putih':'Hitam'})` : 'OFF'}</span>
+            </div>
+
+            <div className="mt-3 flex gap-2">
+              <button onClick={undo} className="px-3 py-1 rounded-2xl bg-white shadow">Undo</button>
+              <button onClick={redo} className="px-3 py-1 rounded-2xl bg-white shadow">Redo</button>
+              <button onClick={()=>setSelected(null)} className="px-3 py-1 rounded-2xl bg-white shadow">Batal Pilih</button>
+            </div>
+          </div>
+
+          <aside className="bg-white rounded-2xl shadow-lg p-4 h-fit sticky top-4">
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-bold">Panel Owner</h2>
+              {!ownerMode ? (
+                <span className="text-xs px-2 py-1 rounded-2xl bg-slate-100">Terkunci</span>
+              ) : (
+                <span className="text-xs px-2 py-1 rounded-2xl bg-green-100">Terbuka</span>
+              )}
+            </div>
+            {!ownerMode ? (
+              <div className="mt-3 space-y-2">
+                <input value={pinInput} onChange={(e)=>setPinInput(e.target.value)} placeholder="Masukkan PIN (default 1234)" className="w-full border rounded-xl px-3 py-2"/>
+                <button onClick={()=>{ if(pinInput===ownerPin){ setOwnerMode(true); setPinInput(""); } }} className="w-full px-3 py-2 rounded-xl bg-emerald-600 text-white shadow">Buka Panel</button>
+              </div>
+            ) : (
+              <div className="mt-3 space-y-4">
+                <div className="grid grid-cols-2 gap-2">
+                  <button onClick={()=>setOwnerMode(false)} className="px-3 py-2 rounded-xl bg-slate-100">Kunci Panel</button>
+                  <button onClick={()=>{
+                    const n = prompt('PIN baru?');
+                    if(n) setOwnerPin(n);
+                  }} className="px-3 py-2 rounded-xl bg-slate-100">Ganti PIN</button>
+                  <button onClick={()=>setLockHumanInput(v=>!v)} className="px-3 py-2 rounded-xl bg-slate-100">{lockHumanInput?'Buka Input':'Kunci Input'}</button>
+                  <button onClick={resetGame} className="px-3 py-2 rounded-xl bg-slate-100">Reset Game</button>
+                  <button onClick={()=>setAiEnabled(v=>!v)} className="px-3 py-2 rounded-xl bg-slate-100">AI {aiEnabled?'OFF':'ON'}</button>
+                  <button onClick={()=>setAiPlays(p=>p==='w'?'b':'w')} className="px-3 py-2 rounded-xl bg-slate-100">AI main: {aiPlays==='w'?'Putih':'Hitam'}</button>
+                  <button onClick={()=>setTurn(t=>other(t))} className="px-3 py-2 rounded-xl bg-slate-100">Ganti Giliran</button>
+                  <button onClick={()=>setFlipped(f=>!f)} className="px-3 py-2 rounded-xl bg-slate-100">Flip Board</button>
+                  <button onClick={undo} className="px-3 py-2 rounded-xl bg-slate-100">Undo</button>
+                  <button onClick={redo} className="px-3 py-2 rounded-xl bg-slate-100">Redo</button>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Kedalaman AI: {aiDepth}</label>
+                  <input type="range" min={1} max={4} value={aiDepth} onChange={(e)=>setAiDepth(parseInt(e.target.value, 10))} className="w-full"/>
+                  <p className="text-xs text-slate-500">Semakin besar, semakin kuat tapi lebih lambat.</p>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Teleport Bidak (Debug)</label>
+                  <TeleportTool board={board} setBoard={setBoard} />
+                  <p className="text-xs text-slate-500">Untuk set posisi manual / uji skenario (khusus Owner).</p>
+                </div>
+              </div>
+            )}
+          </aside>
+        </div>
+      </div>
+    );
+  }
+
+  function TeleportTool({ board, setBoard }){
+    const [from, setFrom] = useState("");
+    const [to, setTo] = useState("");
+
+    const parse = (alg) => {
+      if (!/^([a-h][1-8])$/.test(alg)) return null;
+      const c = alg.charCodeAt(0) - 97;
+      const r = 8 - parseInt(alg[1], 10);
+      return { r, c };
+    };
+
+    const move = () => {
+      const A = parse(from.toLowerCase());
+      const B = parse(to.toLowerCase());
+      if (!A || !B) return alert('Format salah. Contoh: e2 (lowercase) dan e4');
+      const b = board.map(row => row.map(cell => cell ? { ...cell } : null));
+      const p = b[A.r][A.c];
+      b[B.r][B.c] = p;
+      b[A.r][A.c] = null;
+      setBoard(b);
+    };
+
+    return (
+      <div className="flex items-center gap-2">
+        <input value={from} onChange={(e)=>setFrom(e.target.value)} placeholder="dari (mis. e2)" className="border rounded-xl px-2 py-1 w-24"/>
+        <span>→</span>
+        <input value={to} onChange={(e)=>setTo(e.target.value)} placeholder="ke (mis. e4)" className="border rounded-xl px-2 py-1 w-24"/>
+        <button onClick={move} className="px-3 py-1 rounded-xl bg-slate-100">Pindah</button>
+      </div>
+    );
+  }
+
+  // render
+  const root = ReactDOM.createRoot(document.getElementById('root'));
+  root.render(<ChessWithOwnerPanel />);
+
+  </script>
+</body>
+</html>
